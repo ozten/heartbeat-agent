@@ -1,0 +1,261 @@
+#!/usr/bin/env node
+// bin/act — Execution CLI for autonomous agents
+// Loads secrets internally. All external actions go through here.
+// Logs every action to logs/act.log.
+//
+// Usage:
+//   act moltbook post --content "..."
+//   act moltbook comment --post-id <id> --content "..."
+//   act moltbook follow --agent <name>
+//   act moltbook reply --post-id <id> --content "..."
+//   act github push --repo <name|/absolute/path>
+//   act code test --repo <name|/absolute/path>
+//   act code run --repo <name|/absolute/path> --cmd <build|lint|typecheck|test>
+
+const fs = require('fs');
+const path = require('path');
+const { execSync, execFileSync } = require('child_process');
+
+// ─── Config ───────────────────────────────────────────────────────────────────
+
+const PROJECT_DIR = path.join(__dirname, '..');
+const SECRETS_DIR = path.join(PROJECT_DIR, 'secrets');
+const LOG_FILE = path.join(PROJECT_DIR, 'logs', 'act.log');
+const CONFIG_FILE = path.join(PROJECT_DIR, 'config.json');
+
+function loadConfig() {
+  if (!fs.existsSync(CONFIG_FILE)) {
+    return { allowedRepos: [], allowedCodeCmds: ['build', 'lint', 'typecheck', 'test'] };
+  }
+  try {
+    return JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
+  } catch {
+    return { allowedRepos: [], allowedCodeCmds: ['build', 'lint', 'typecheck', 'test'] };
+  }
+}
+
+const config = loadConfig();
+const ALLOWED_REPOS = config.allowedRepos || [];
+const ALLOWED_CODE_CMDS = config.allowedCodeCmds || ['build', 'lint', 'typecheck', 'test'];
+
+// ─── Logging ──────────────────────────────────────────────────────────────────
+
+function log(level, message, data) {
+  fs.mkdirSync(path.dirname(LOG_FILE), { recursive: true });
+  const entry = {
+    ts: new Date().toISOString(),
+    level,
+    message,
+    ...(data ? { data } : {}),
+  };
+  fs.appendFileSync(LOG_FILE, JSON.stringify(entry) + '\n');
+  console.error(`[act] ${message}`);
+}
+
+function success(data) {
+  console.log(JSON.stringify({ ok: true, ...data }));
+}
+
+function fail(message, code = 1) {
+  console.error(JSON.stringify({ ok: false, error: message }));
+  process.exit(code);
+}
+
+// ─── Secrets (loaded only when needed, never logged) ─────────────────────────
+
+function loadMoltbook() {
+  try {
+    return JSON.parse(fs.readFileSync(path.join(SECRETS_DIR, 'moltbook.json'), 'utf8'));
+  } catch {
+    fail('Could not load secrets/moltbook.json — copy secrets/moltbook.example.json and fill it in');
+  }
+}
+
+// ─── HTTP helper ─────────────────────────────────────────────────────────────
+
+function moltbookRequest(method, endpoint, body, secrets) {
+  const url = `${secrets.apiBase}${endpoint}`;
+  const args = [
+    '-s', '-f',
+    '-X', method,
+    '-H', `Authorization: Bearer ${secrets.apiKey}`,
+    '-H', 'Content-Type: application/json',
+    '--max-time', '30',
+  ];
+  if (body) {
+    args.push('-d', JSON.stringify(body));
+  }
+  args.push(url);
+
+  // execFileSync avoids shell interpolation of JSON body content
+  try {
+    const result = execFileSync('curl', args, {
+      encoding: 'utf8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    return JSON.parse(result);
+  } catch (e) {
+    const stderr = e.stderr || '';
+    throw new Error(`HTTP ${method} ${endpoint} failed: ${stderr.slice(0, 200)}`);
+  }
+}
+
+// ─── Subcommands ─────────────────────────────────────────────────────────────
+
+function moltbook_post(args) {
+  if (!args.content) fail('--content required');
+  log('info', 'moltbook:post', { length: args.content.length });
+
+  const secrets = loadMoltbook();
+  const result = moltbookRequest('POST', '/posts', { content: args.content }, secrets);
+
+  log('info', 'moltbook:post complete', { postId: result?.post?.id || result?.id });
+  success({ postId: result?.post?.id || result?.id });
+}
+
+function moltbook_comment(args) {
+  if (!args['post-id']) fail('--post-id required');
+  if (!args.content) fail('--content required');
+  log('info', 'moltbook:comment', { postId: args['post-id'], length: args.content.length });
+
+  const secrets = loadMoltbook();
+  const result = moltbookRequest('POST', `/posts/${args['post-id']}/comments`, { content: args.content }, secrets);
+
+  log('info', 'moltbook:comment complete', { commentId: result?.comment?.id || result?.id });
+  success({ commentId: result?.comment?.id || result?.id });
+}
+
+function moltbook_reply(args) {
+  return moltbook_comment(args);
+}
+
+function moltbook_follow(args) {
+  if (!args.agent) fail('--agent required');
+  log('info', 'moltbook:follow', { agent: args.agent });
+
+  const secrets = loadMoltbook();
+  const result = moltbookRequest('POST', `/agents/${args.agent}/follow`, null, secrets);
+
+  log('info', 'moltbook:follow complete', { agent: args.agent });
+  success({ agent: args.agent, result });
+}
+
+function resolveRepo(nameOrPath) {
+  if (path.isAbsolute(nameOrPath)) return nameOrPath;
+  // Check if it matches a basename in the allowed list
+  const match = ALLOWED_REPOS.find(r => path.basename(r) === nameOrPath);
+  if (match) return match;
+  return nameOrPath; // will fail the allowlist check below
+}
+
+function github_push(args) {
+  if (!args.repo) fail('--repo required');
+
+  const repoPath = resolveRepo(args.repo);
+
+  if (!ALLOWED_REPOS.includes(repoPath)) {
+    fail(`Repo "${repoPath}" is not in config.json allowedRepos: ${ALLOWED_REPOS.join(', ')}`);
+  }
+  if (!fs.existsSync(path.join(repoPath, '.git'))) {
+    fail(`${repoPath} is not a git repository`);
+  }
+
+  log('info', 'github:push', { repo: repoPath });
+
+  try {
+    const branch = execSync('git rev-parse --abbrev-ref HEAD', { cwd: repoPath, encoding: 'utf8' }).trim();
+    execSync(`git push origin ${branch}`, { cwd: repoPath, encoding: 'utf8' });
+    log('info', 'github:push complete', { repo: repoPath, branch });
+    success({ repo: repoPath, branch });
+  } catch (e) {
+    log('error', 'github:push failed', { error: e.message });
+    fail(`git push failed: ${e.message}`);
+  }
+}
+
+function code_test(args) {
+  if (!args.repo) fail('--repo required');
+
+  const repoPath = resolveRepo(args.repo);
+
+  if (!ALLOWED_REPOS.includes(repoPath)) {
+    fail(`Repo "${repoPath}" is not in config.json allowedRepos`);
+  }
+
+  log('info', 'code:test', { repo: repoPath });
+
+  try {
+    const output = execSync('npm test', { cwd: repoPath, encoding: 'utf8', timeout: 120000 });
+    log('info', 'code:test complete', { repo: repoPath });
+    success({ repo: repoPath, output: output.slice(-2000) });
+  } catch (e) {
+    log('error', 'code:test failed', { error: e.message.slice(0, 500) });
+    fail(`npm test failed: ${e.message.slice(0, 500)}`);
+  }
+}
+
+function code_run(args) {
+  if (!args.repo) fail('--repo required');
+  if (!args.cmd) fail('--cmd required');
+  if (!ALLOWED_CODE_CMDS.includes(args.cmd)) {
+    fail(`--cmd must be one of: ${ALLOWED_CODE_CMDS.join(', ')}`);
+  }
+
+  const repoPath = resolveRepo(args.repo);
+
+  if (!ALLOWED_REPOS.includes(repoPath)) {
+    fail(`Repo "${repoPath}" is not in config.json allowedRepos`);
+  }
+
+  const npmScript = args.cmd === 'test' ? 'npm test' : `npm run ${args.cmd}`;
+  log('info', 'code:run', { repo: repoPath, cmd: args.cmd });
+
+  try {
+    const output = execSync(npmScript, { cwd: repoPath, encoding: 'utf8', timeout: 120000 });
+    log('info', 'code:run complete', { repo: repoPath, cmd: args.cmd });
+    success({ repo: repoPath, cmd: args.cmd, output: output.slice(-2000) });
+  } catch (e) {
+    log('error', 'code:run failed', { error: e.message.slice(0, 500) });
+    fail(`${npmScript} failed: ${e.message.slice(0, 500)}`);
+  }
+}
+
+// ─── Routing ─────────────────────────────────────────────────────────────────
+
+function parseArgs(argv) {
+  const args = {};
+  let i = 0;
+  while (i < argv.length) {
+    if (argv[i].startsWith('--')) {
+      const key = argv[i].slice(2);
+      const val = argv[i + 1] && !argv[i + 1].startsWith('--') ? argv[i + 1] : true;
+      args[key] = val;
+      i += val === true ? 1 : 2;
+    } else {
+      i++;
+    }
+  }
+  return args;
+}
+
+const [,, domain, subcmd, ...rest] = process.argv;
+const args = parseArgs(rest);
+
+if (!domain || !subcmd) {
+  console.error('Usage: act <moltbook|github|code> <subcommand> [options]');
+  process.exit(1);
+}
+
+const route = `${domain}:${subcmd}`;
+
+switch (route) {
+  case 'moltbook:post':    moltbook_post(args);    break;
+  case 'moltbook:comment': moltbook_comment(args); break;
+  case 'moltbook:reply':   moltbook_reply(args);   break;
+  case 'moltbook:follow':  moltbook_follow(args);  break;
+  case 'github:push':      github_push(args);      break;
+  case 'code:test':        code_test(args);        break;
+  case 'code:run':         code_run(args);         break;
+  default:
+    fail(`Unknown command: ${route}`);
+}

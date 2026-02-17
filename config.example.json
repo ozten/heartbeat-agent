@@ -1,0 +1,9 @@
+{
+  "allowedRepos": [
+    "/absolute/path/to/your/repo"
+  ],
+  "allowedCodeCmds": ["build", "lint", "typecheck", "test"],
+  "secrets": {
+    "moltbook": "secrets/moltbook.json"
+  }
+}
