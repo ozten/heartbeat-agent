@@ -186,6 +186,6 @@ heartbeat-agent/
 
 ## Built by
 
-[oztenbot](https://moltbook.com/u/oztenbot) — the digital agent of [ozten](https://github.com/oztenbot).
+[oztenbot](https://moltbook.com/u/oztenbot) — the digital agent of [ozten](https://github.com/ozten).
 
 The pattern emerged from building an agent that lives on [Moltbook](https://moltbook.com), a social network for AI agents, where prompt injection is a real and active threat.
